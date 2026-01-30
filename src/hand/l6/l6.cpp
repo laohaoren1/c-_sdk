@@ -17,7 +17,7 @@ L6::~L6() {
 }
 
 void L6::close() {
-  if (lifecycle_->is_closed()) {
+  if (closed_) {
     return;
   }
 
@@ -34,13 +34,17 @@ void L6::close() {
     dispatcher_.stop();
   } catch (...) {
   }
-  lifecycle_->finish_close();
+
+  closed_ = true;
 }
 
-bool L6::is_closed() const { return lifecycle_->is_closed(); }
+bool L6::is_closed() const { return closed_; }
 
 void L6::ensure_open() const {
-  lifecycle_->ensure_open();
+  if (closed_) {
+    throw StateError(
+        "L6 interface is closed. Create a new instance or use context manager.");
+  }
 }
 
 }  // namespace linkerhand::hand::l6
