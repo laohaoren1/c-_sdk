@@ -17,34 +17,27 @@ L6::~L6() {
 }
 
 void L6::close() {
-  if (closed_) {
+  // Idempotent: lifecycle_->close() returns false if already closed
+  if (!lifecycle_->close()) {
     return;
   }
 
+  // Stop all streaming (cleanup operations, allowed after close)
   try {
     force_sensor.stop_streaming();
     angle.stop_streaming();
   } catch (...) {
   }
 
-  lifecycle_->begin_close();
-  lifecycle_->notify_closing();
-
+  // Stop the communication layer
   try {
     dispatcher_.stop();
   } catch (...) {
   }
-
-  closed_ = true;
 }
 
-bool L6::is_closed() const { return closed_; }
-
-void L6::ensure_open() const {
-  if (closed_) {
-    throw StateError(
-        "L6 interface is closed. Create a new instance or use context manager.");
-  }
+bool L6::is_closed() const {
+  return lifecycle_->is_closed();
 }
 
 }  // namespace linkerhand::hand::l6

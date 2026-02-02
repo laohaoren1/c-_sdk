@@ -19,7 +19,6 @@ namespace linkerhand {
 
 enum class LifecycleState {
   Open,
-  Closing,
   Closed,
 };
 
@@ -37,6 +36,11 @@ class Lifecycle {
     return state_;
   }
 
+  bool is_open() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return state_ == LifecycleState::Open;
+  }
+
   bool is_closed() const {
     std::lock_guard<std::mutex> lock(mutex_);
     return state_ == LifecycleState::Closed;
@@ -49,20 +53,16 @@ class Lifecycle {
     }
   }
 
-  void begin_close() {
-    std::lock_guard<std::mutex> lock(mutex_);
-    if (state_ == LifecycleState::Open) {
-      state_ = LifecycleState::Closing;
-    }
-  }
-
-  void finish_close() {
+  /// Single atomic close operation: sets state to Closed and notifies all subscribers.
+  /// Idempotent: returns false if already closed, true if this call performed the close.
+  bool close() {
     std::vector<std::shared_ptr<Subscription>> subscriptions;
     {
       std::lock_guard<std::mutex> lock(mutex_);
-      if (state_ != LifecycleState::Closed) {
-        state_ = LifecycleState::Closed;
+      if (state_ == LifecycleState::Closed) {
+        return false;  // Already closed
       }
+      state_ = LifecycleState::Closed;
       notification_count_ += 1;
       subscriptions.reserve(subscribers_.size());
       for (const auto& [id, sub] : subscribers_) {
@@ -84,33 +84,7 @@ class Lifecycle {
       } catch (...) {
       }
     }
-  }
-
-  void notify_closing() {
-    std::vector<std::shared_ptr<Subscription>> subscriptions;
-    {
-      std::lock_guard<std::mutex> lock(mutex_);
-      notification_count_ += 1;
-      subscriptions.reserve(subscribers_.size());
-      for (const auto& [id, sub] : subscribers_) {
-        (void)id;
-        subscriptions.push_back(sub);
-      }
-    }
-
-    cv_.notify_all();
-    for (const auto& sub : subscriptions) {
-      if (!sub) {
-        continue;
-      }
-      if (!sub->active.load()) {
-        continue;
-      }
-      try {
-        sub->cb();
-      } catch (...) {
-      }
-    }
+    return true;
   }
 
   std::uint64_t notification_count() const {
