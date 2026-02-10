@@ -32,10 +32,6 @@ class SingleForceSensorManager {
   SingleForceSensorManager(
       std::uint32_t arbitration_id,
       CANMessageDispatcher& dispatcher,
-      std::uint8_t command_prefix);
-  SingleForceSensorManager(
-      std::uint32_t arbitration_id,
-      CANMessageDispatcher& dispatcher,
       std::uint8_t command_prefix,
       std::shared_ptr<linkerhand::Lifecycle> lifecycle);
   ~SingleForceSensorManager();
@@ -57,7 +53,6 @@ class SingleForceSensorManager {
 
 class ForceSensorManager {
  public:
-  ForceSensorManager(std::uint32_t arbitration_id, CANMessageDispatcher& dispatcher);
   ForceSensorManager(
       std::uint32_t arbitration_id,
       CANMessageDispatcher& dispatcher,

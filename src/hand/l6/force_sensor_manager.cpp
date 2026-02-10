@@ -332,16 +332,6 @@ struct SingleForceSensorManager::Impl {
 SingleForceSensorManager::SingleForceSensorManager(
     std::uint32_t arbitration_id,
     CANMessageDispatcher& dispatcher,
-    std::uint8_t command_prefix)
-    : SingleForceSensorManager(
-          arbitration_id,
-          dispatcher,
-          command_prefix,
-          std::make_shared<linkerhand::Lifecycle>("SingleForceSensorManager")) {}
-
-SingleForceSensorManager::SingleForceSensorManager(
-    std::uint32_t arbitration_id,
-    CANMessageDispatcher& dispatcher,
     std::uint8_t command_prefix,
     std::shared_ptr<linkerhand::Lifecycle> lifecycle)
     : impl_(std::make_unique<Impl>(arbitration_id, dispatcher, command_prefix, lifecycle)),
@@ -579,9 +569,6 @@ struct ForceSensorManager::Impl {
   std::thread aggregation_thread;
   std::vector<std::thread> reader_threads;
 };
-
-ForceSensorManager::ForceSensorManager(std::uint32_t arbitration_id, CANMessageDispatcher& dispatcher)
-    : ForceSensorManager(arbitration_id, dispatcher, std::make_shared<linkerhand::Lifecycle>("ForceSensorManager")) {}
 
 ForceSensorManager::ForceSensorManager(
     std::uint32_t arbitration_id,

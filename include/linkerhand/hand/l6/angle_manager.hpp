@@ -20,7 +20,6 @@ struct AngleData {
 
 class AngleManager {
  public:
-  AngleManager(std::uint32_t arbitration_id, CANMessageDispatcher& dispatcher);
   AngleManager(
       std::uint32_t arbitration_id,
       CANMessageDispatcher& dispatcher,

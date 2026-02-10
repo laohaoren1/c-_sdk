@@ -99,15 +99,9 @@ void CANMessageDispatcher::send(const CanMessage& msg) {
   (void)msg;
   throw CANError("SocketCAN backend is only supported on Linux");
 #else
-  if (!running_.load(std::memory_order_acquire)) {
-    throw StateError("CAN dispatcher is stopped");
-  }
   std::lock_guard<std::mutex> lock(socket_mutex_);
-  if (!running_.load(std::memory_order_acquire)) {
-    throw StateError("CAN dispatcher is stopped");
-  }
   if (socket_fd_ < 0) {
-    throw CANError("CAN dispatcher is not initialized");
+    throw StateError("CAN dispatcher is stopped");
   }
   if (msg.dlc > 8) {
     throw ValidationError("CAN frame dlc must be <= 8");

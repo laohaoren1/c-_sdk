@@ -312,9 +312,6 @@ struct AngleManager::Impl {
   std::thread streaming_thread;
 };
 
-AngleManager::AngleManager(std::uint32_t arbitration_id, CANMessageDispatcher& dispatcher)
-    : AngleManager(arbitration_id, dispatcher, std::make_shared<linkerhand::Lifecycle>("AngleManager")) {}
-
 AngleManager::AngleManager(
     std::uint32_t arbitration_id,
     CANMessageDispatcher& dispatcher,
