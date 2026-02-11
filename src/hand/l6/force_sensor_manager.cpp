@@ -3,10 +3,12 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
-#include <condition_variable>
 #include <cstddef>
+#include <future>
 #include <mutex>
 #include <thread>
+#include <utility>
+#include <vector>
 
 #include "linkerhand/exceptions.hpp"
 #include "linkerhand/iterable_queue.hpp"
@@ -18,14 +20,14 @@ namespace {
 
 constexpr std::size_t kFrameCount = 12;
 constexpr std::size_t kBytesPerFrame = 6;
-constexpr std::size_t kTotalBytes = kFrameCount * kBytesPerFrame;
 
 struct FrameBatch {
   std::array<std::optional<std::array<std::uint8_t, kBytesPerFrame>>, kFrameCount> frames{};
   std::size_t count = 0;
-  double started_at = detail::now_unix_seconds();
 
-  FrameBatch add_frame(std::size_t frame_id, const std::array<std::uint8_t, kBytesPerFrame>& data) const {
+  [[nodiscard]] FrameBatch add_frame(
+      std::size_t frame_id,
+      const std::array<std::uint8_t, kBytesPerFrame>& data) const {
     FrameBatch next = *this;
     if (!next.frames[frame_id].has_value()) {
       next.count += 1;
@@ -34,18 +36,17 @@ struct FrameBatch {
     return next;
   }
 
-  bool is_complete() const { return count == kFrameCount; }
+  [[nodiscard]] bool is_complete() const noexcept { return count == kFrameCount; }
 
-  ForceSensorData assemble() const {
+  [[nodiscard]] ForceSensorData assemble() const {
     ForceSensorData out{};
     std::size_t offset = 0;
     for (std::size_t i = 0; i < kFrameCount; ++i) {
-      const auto& frame = frames[i];
-      if (!frame.has_value()) {
+      if (!frames[i].has_value()) {
         throw StateError("Incomplete frame batch");
       }
       for (std::size_t j = 0; j < kBytesPerFrame; ++j) {
-        out.values[offset++] = (*frame)[j];
+        out.values[offset++] = (*frames[i])[j];
       }
     }
     out.timestamp = detail::now_unix_seconds();
@@ -53,92 +54,65 @@ struct FrameBatch {
   }
 };
 
-struct ForceWaiter {
-  std::mutex mutex;
-  std::condition_variable cv;
-  bool ready = false;
-  std::optional<ForceSensorData> data;
-};
-
 }  // namespace
 
+// ============================================================================
+// SingleForceSensorManager::Impl
+// ============================================================================
+
 struct SingleForceSensorManager::Impl {
-  Impl(
-      std::uint32_t arbitration_id_,
-      CANMessageDispatcher& dispatcher_,
-      std::uint8_t command_prefix_,
-      std::shared_ptr<linkerhand::Lifecycle> lifecycle_)
-      : arbitration_id(arbitration_id_),
-        dispatcher(dispatcher_),
-        command_prefix(command_prefix_),
-        lifecycle(std::move(lifecycle_)) {
-    if (!lifecycle) {
+  Impl(std::uint32_t arbitration_id,
+       CANMessageDispatcher& dispatcher,
+       std::uint8_t command_prefix,
+       std::shared_ptr<linkerhand::Lifecycle> lifecycle)
+      : arbitration_id(arbitration_id),
+        dispatcher(dispatcher),
+        command_prefix(command_prefix),
+        lifecycle(std::move(lifecycle)) {
+    if (!this->lifecycle) {
       throw ValidationError("lifecycle must not be null");
     }
-    subscription_id = dispatcher.subscribe([this](const CanMessage& msg) { on_message(msg); });
-    lifecycle_subscription_id = lifecycle->subscribe([this] { notify_waiters(); });
+    subscription_id = dispatcher.subscribe(
+        [this](const CanMessage& msg) { on_message(msg); });
+    lifecycle_subscription_id = this->lifecycle->subscribe(
+        [this] { cancel_all_waiters(); });
   }
 
   ~Impl() {
-    try {
-      stop_streaming();
-    } catch (...) {
-    }
-    try {
-      lifecycle->unsubscribe(lifecycle_subscription_id);
-    } catch (...) {
-    }
+    try { stop_streaming(); } catch (...) {}
+    try { lifecycle->unsubscribe(lifecycle_subscription_id); } catch (...) {}
     dispatcher.unsubscribe(subscription_id);
   }
 
-  ForceSensorData get_data_blocking(double timeout_ms) {
-    if (timeout_ms <= 0) {
-      throw ValidationError("timeout_ms must be positive");
+  ForceSensorData get_data_blocking(std::chrono::milliseconds timeout) {
+    if (timeout.count() <= 0) {
+      throw ValidationError("timeout must be positive");
     }
 
-    auto waiter = std::make_shared<ForceWaiter>();
+    auto promise = std::make_shared<std::promise<ForceSensorData>>();
+    auto future = promise->get_future();
+
     {
       std::lock_guard<std::mutex> lock(waiters_mutex);
-      waiters.push_back(waiter);
+      waiters.push_back(promise);
     }
 
     try {
       send_request();
     } catch (...) {
-      std::lock_guard<std::mutex> lock(waiters_mutex);
-      waiters.erase(
-          std::remove_if(
-              waiters.begin(),
-              waiters.end(),
-              [&](const auto& w) { return w.get() == waiter.get(); }),
-          waiters.end());
+      remove_waiter(promise);
       throw;
     }
 
-    const auto timeout =
-        std::chrono::duration_cast<std::chrono::steady_clock::duration>(
-            std::chrono::duration<double, std::milli>(timeout_ms));
-
-    std::unique_lock<std::mutex> waiter_lock(waiter->mutex);
-    const bool ok = waiter->cv.wait_for(
-        waiter_lock, timeout, [&] { return waiter->ready || lifecycle->state() != linkerhand::LifecycleState::Open; });
-    if (ok && waiter->data.has_value()) {
-      return *waiter->data;
+    const auto status = future.wait_for(timeout);
+    if (status == std::future_status::ready) {
+      return future.get();
     }
 
-    {
-      std::lock_guard<std::mutex> lock(waiters_mutex);
-      waiters.erase(
-          std::remove_if(
-              waiters.begin(),
-              waiters.end(),
-              [&](const auto& w) { return w.get() == waiter.get(); }),
-          waiters.end());
-    }
-
-    // If lifecycle is no longer open, throw StateError before TimeoutError
+    remove_waiter(promise);
     lifecycle->ensure_open();
-    throw TimeoutError("No data received within " + std::to_string(timeout_ms) + "ms");
+    throw TimeoutError("No force data received within " +
+                       std::to_string(timeout.count()) + "ms");
   }
 
   std::optional<ForceSensorData> get_latest_data() const {
@@ -146,9 +120,10 @@ struct SingleForceSensorManager::Impl {
     return latest_data;
   }
 
-  IterableQueue<ForceSensorData> stream(double interval_ms, std::size_t maxsize) {
-    if (interval_ms <= 0) {
-      throw ValidationError("interval_ms must be positive");
+  IterableQueue<ForceSensorData> stream(std::chrono::milliseconds interval,
+                                        std::size_t maxsize) {
+    if (interval.count() <= 0) {
+      throw ValidationError("interval must be positive");
     }
     if (maxsize == 0) {
       throw ValidationError("maxsize must be positive");
@@ -166,11 +141,8 @@ struct SingleForceSensorManager::Impl {
       streaming_queue = queue;
       streaming_running.store(true);
       try {
-        streaming_thread = std::thread([this, interval_ms, queue] {
-          try {
-            streaming_loop(interval_ms);
-          } catch (...) {
-          }
+        streaming_thread = std::thread([this, interval, queue] {
+          try { streaming_loop(interval); } catch (...) {}
           queue.close();
           streaming_running.store(false);
         });
@@ -180,7 +152,6 @@ struct SingleForceSensorManager::Impl {
         throw;
       }
     }
-
     return queue;
   }
 
@@ -193,7 +164,6 @@ struct SingleForceSensorManager::Impl {
       }
       return;
     }
-
     streaming_running.store(false);
     streaming_queue->close();
     streaming_queue.reset();
@@ -202,6 +172,7 @@ struct SingleForceSensorManager::Impl {
     }
   }
 
+ private:
   void send_request() {
     CanMessage msg{};
     msg.arbitration_id = arbitration_id;
@@ -212,40 +183,19 @@ struct SingleForceSensorManager::Impl {
     dispatcher.send(msg);
   }
 
-  void streaming_loop(double interval_ms) {
-    const auto sleep_duration =
-        std::chrono::duration_cast<std::chrono::steady_clock::duration>(
-            std::chrono::duration<double, std::milli>(interval_ms));
-
+  void streaming_loop(std::chrono::milliseconds interval) {
     while (streaming_running.load()) {
       send_request();
-      std::this_thread::sleep_for(sleep_duration);
-    }
-  }
-
-  void notify_waiters() {
-    std::vector<std::shared_ptr<ForceWaiter>> waiters_copy;
-    {
-      std::lock_guard<std::mutex> lock(waiters_mutex);
-      waiters_copy = waiters;
-    }
-    for (const auto& waiter : waiters_copy) {
-      waiter->cv.notify_one();
+      std::this_thread::sleep_for(interval);
     }
   }
 
   void on_message(const CanMessage& msg) {
-    if (msg.arbitration_id != arbitration_id) {
-      return;
-    }
-    if (msg.dlc < 8 || msg.data[0] != command_prefix) {
-      return;
-    }
+    if (msg.arbitration_id != arbitration_id) return;
+    if (msg.dlc < 8 || msg.data[0] != command_prefix) return;
 
     const std::size_t frame_idx = static_cast<std::size_t>(msg.data[1] >> 4);
-    if (frame_idx >= kFrameCount) {
-      return;
-    }
+    if (frame_idx >= kFrameCount) return;
 
     std::array<std::uint8_t, kBytesPerFrame> frame_data{};
     for (std::size_t i = 0; i < kBytesPerFrame; ++i) {
@@ -257,33 +207,25 @@ struct SingleForceSensorManager::Impl {
     }
     frame_batch = frame_batch->add_frame(frame_idx, frame_data);
 
-    if (!frame_batch->is_complete()) {
-      return;
-    }
+    if (!frame_batch->is_complete()) return;
 
-    const ForceSensorData complete_data = frame_batch->assemble();
+    ForceSensorData complete_data = frame_batch->assemble();
     frame_batch.reset();
-
-    on_complete_data(complete_data);
+    dispatch_data(complete_data);
   }
 
-  void on_complete_data(const ForceSensorData& data) {
+  void dispatch_data(const ForceSensorData& data) {
     {
       std::lock_guard<std::mutex> lock(latest_mutex);
       latest_data = data;
     }
 
-    std::vector<std::shared_ptr<ForceWaiter>> waiters_copy;
     {
       std::lock_guard<std::mutex> lock(waiters_mutex);
-      waiters_copy = waiters;
+      for (auto& p : waiters) {
+        try { p->set_value(data); } catch (...) {}
+      }
       waiters.clear();
-    }
-    for (const auto& waiter : waiters_copy) {
-      std::lock_guard<std::mutex> lock(waiter->mutex);
-      waiter->data = data;
-      waiter->ready = true;
-      waiter->cv.notify_one();
     }
 
     std::optional<IterableQueue<ForceSensorData>> q;
@@ -291,21 +233,30 @@ struct SingleForceSensorManager::Impl {
       std::lock_guard<std::mutex> lock(streaming_mutex);
       q = streaming_queue;
     }
-    if (!q.has_value()) {
-      return;
-    }
+    if (!q.has_value()) return;
 
     try {
       q->put_nowait(data);
     } catch (const StateError&) {
-      return;
     } catch (const QueueFull&) {
-      try {
-        q->get_nowait();
-        q->put_nowait(data);
-      } catch (const QueueEmpty&) {
-      }
+      try { q->get_nowait(); q->put_nowait(data); }
+      catch (const QueueEmpty&) {}
     }
+  }
+
+  void cancel_all_waiters() {
+    std::lock_guard<std::mutex> lock(waiters_mutex);
+    for (auto& p : waiters) {
+      try {
+        p->set_exception(std::make_exception_ptr(StateError("Interface closed")));
+      } catch (...) {}
+    }
+    waiters.clear();
+  }
+
+  void remove_waiter(const std::shared_ptr<std::promise<ForceSensorData>>& waiter) {
+    std::lock_guard<std::mutex> lock(waiters_mutex);
+    waiters.erase(std::remove(waiters.begin(), waiters.end(), waiter), waiters.end());
   }
 
   std::uint32_t arbitration_id;
@@ -321,13 +272,15 @@ struct SingleForceSensorManager::Impl {
   std::optional<ForceSensorData> latest_data;
 
   mutable std::mutex waiters_mutex;
-  std::vector<std::shared_ptr<ForceWaiter>> waiters;
+  std::vector<std::shared_ptr<std::promise<ForceSensorData>>> waiters;
 
   mutable std::mutex streaming_mutex;
   std::optional<IterableQueue<ForceSensorData>> streaming_queue;
   std::atomic<bool> streaming_running{false};
   std::thread streaming_thread;
 };
+
+// ---- SingleForceSensorManager public API ----
 
 SingleForceSensorManager::SingleForceSensorManager(
     std::uint32_t arbitration_id,
@@ -339,9 +292,9 @@ SingleForceSensorManager::SingleForceSensorManager(
 
 SingleForceSensorManager::~SingleForceSensorManager() = default;
 
-ForceSensorData SingleForceSensorManager::get_data_blocking(double timeout_ms) {
+ForceSensorData SingleForceSensorManager::get_data_blocking(std::chrono::milliseconds timeout) {
   lifecycle_->ensure_open();
-  return impl_->get_data_blocking(timeout_ms);
+  return impl_->get_data_blocking(timeout);
 }
 
 std::optional<ForceSensorData> SingleForceSensorManager::get_latest_data() const {
@@ -349,58 +302,55 @@ std::optional<ForceSensorData> SingleForceSensorManager::get_latest_data() const
   return impl_->get_latest_data();
 }
 
-IterableQueue<ForceSensorData> SingleForceSensorManager::stream(double interval_ms, std::size_t maxsize) {
+IterableQueue<ForceSensorData> SingleForceSensorManager::stream(
+    std::chrono::milliseconds interval, std::size_t maxsize) {
   lifecycle_->ensure_open();
-  return impl_->stream(interval_ms, maxsize);
+  return impl_->stream(interval, maxsize);
 }
 
 void SingleForceSensorManager::stop_streaming() {
-  // stop_streaming is a cleanup operation, allowed in any lifecycle state
   impl_->stop_streaming();
 }
 
+// ============================================================================
+// ForceSensorManager::Impl — aggregation layer using array instead of map
+// ============================================================================
+
 struct ForceSensorManager::Impl {
-  explicit Impl(
-      std::uint32_t arbitration_id_,
-      CANMessageDispatcher& dispatcher_,
-      std::shared_ptr<linkerhand::Lifecycle> lifecycle_)
-      : arbitration_id(arbitration_id_),
-        dispatcher(dispatcher_),
-        lifecycle(std::move(lifecycle_)) {
-    if (!lifecycle) {
+  Impl(std::uint32_t arbitration_id,
+       CANMessageDispatcher& dispatcher,
+       std::shared_ptr<linkerhand::Lifecycle> lifecycle)
+      : arbitration_id(arbitration_id),
+        dispatcher(dispatcher),
+        lifecycle(std::move(lifecycle)) {
+    if (!this->lifecycle) {
       throw ValidationError("lifecycle must not be null");
     }
-    fingers.emplace("thumb", std::make_unique<SingleForceSensorManager>(arbitration_id, dispatcher, 0xB1, lifecycle));
-    fingers.emplace("index", std::make_unique<SingleForceSensorManager>(arbitration_id, dispatcher, 0xB2, lifecycle));
-    fingers.emplace("middle", std::make_unique<SingleForceSensorManager>(arbitration_id, dispatcher, 0xB3, lifecycle));
-    fingers.emplace("ring", std::make_unique<SingleForceSensorManager>(arbitration_id, dispatcher, 0xB4, lifecycle));
-    fingers.emplace("pinky", std::make_unique<SingleForceSensorManager>(arbitration_id, dispatcher, 0xB5, lifecycle));
+    for (std::size_t i = 0; i < kFingerCount; ++i) {
+      fingers[i] = std::make_unique<SingleForceSensorManager>(
+          arbitration_id, dispatcher, kFingerCommands[i], this->lifecycle);
+    }
   }
 
   ~Impl() {
-    try {
-      stop_streaming();
-    } catch (...) {
-    }
+    try { stop_streaming(); } catch (...) {}
   }
 
-  AllFingersData get_data_blocking(double timeout_ms) {
-    if (timeout_ms <= 0) {
-      throw ValidationError("timeout_ms must be positive");
+  AllFingersData get_data_blocking(std::chrono::milliseconds timeout) {
+    if (timeout.count() <= 0) {
+      throw ValidationError("timeout must be positive");
     }
-
     AllFingersData out{};
-    out.thumb = fingers.at("thumb")->get_data_blocking(timeout_ms);
-    out.index = fingers.at("index")->get_data_blocking(timeout_ms);
-    out.middle = fingers.at("middle")->get_data_blocking(timeout_ms);
-    out.ring = fingers.at("ring")->get_data_blocking(timeout_ms);
-    out.pinky = fingers.at("pinky")->get_data_blocking(timeout_ms);
+    for (std::size_t i = 0; i < kFingerCount; ++i) {
+      out.fingers[i] = fingers[i]->get_data_blocking(timeout);
+    }
     return out;
   }
 
-  IterableQueue<AllFingersData> stream(double interval_ms, std::size_t maxsize) {
-    if (interval_ms <= 0) {
-      throw ValidationError("interval_ms must be positive");
+  IterableQueue<AllFingersData> stream(std::chrono::milliseconds interval,
+                                       std::size_t maxsize) {
+    if (interval.count() <= 0) {
+      throw ValidationError("interval must be positive");
     }
     if (maxsize == 0) {
       throw ValidationError("maxsize must be positive");
@@ -414,35 +364,32 @@ struct ForceSensorManager::Impl {
       }
       streaming_queue = queue;
 
-      std::unordered_map<std::string, IterableQueue<ForceSensorData>> finger_queues_copy;
+      // Start per-finger streams
+      std::array<IterableQueue<ForceSensorData>, kFingerCount> finger_queues{
+          IterableQueue<ForceSensorData>(0),
+          IterableQueue<ForceSensorData>(0),
+          IterableQueue<ForceSensorData>(0),
+          IterableQueue<ForceSensorData>(0),
+          IterableQueue<ForceSensorData>(0),
+      };
       try {
-        finger_queues_copy.emplace("thumb", fingers.at("thumb")->stream(interval_ms, maxsize));
-        finger_queues_copy.emplace("index", fingers.at("index")->stream(interval_ms, maxsize));
-        finger_queues_copy.emplace("middle", fingers.at("middle")->stream(interval_ms, maxsize));
-        finger_queues_copy.emplace("ring", fingers.at("ring")->stream(interval_ms, maxsize));
-        finger_queues_copy.emplace("pinky", fingers.at("pinky")->stream(interval_ms, maxsize));
-
+        for (std::size_t i = 0; i < kFingerCount; ++i) {
+          finger_queues[i] = fingers[i]->stream(interval, maxsize);
+        }
         aggregation_running.store(true);
-        aggregation_thread = std::thread([this, finger_queues_copy, queue] {
-          try {
-            aggregation_loop(finger_queues_copy, queue);
-          } catch (...) {
-          }
-        });
+        aggregation_thread = std::thread(
+            [this, finger_queues, queue] {
+              try { aggregation_loop(finger_queues, queue); } catch (...) {}
+            });
       } catch (...) {
-        for (auto& [name, sensor] : fingers) {
-          (void)name;
-          try {
-            sensor->stop_streaming();
-          } catch (...) {
-          }
+        for (auto& f : fingers) {
+          try { f->stop_streaming(); } catch (...) {}
         }
         aggregation_running.store(false);
         streaming_queue.reset();
         throw;
       }
     }
-
     return queue;
   }
 
@@ -454,17 +401,14 @@ struct ForceSensorManager::Impl {
         aggregation_thread.join();
       }
       for (auto& t : reader_threads) {
-        if (t.joinable()) {
-          t.join();
-        }
+        if (t.joinable()) t.join();
       }
       reader_threads.clear();
       return;
     }
 
-    for (auto& [name, sensor] : fingers) {
-      (void)name;
-      sensor->stop_streaming();
+    for (auto& f : fingers) {
+      f->stop_streaming();
     }
 
     aggregation_running.store(false);
@@ -475,93 +419,87 @@ struct ForceSensorManager::Impl {
       aggregation_thread.join();
     }
     for (auto& t : reader_threads) {
-      if (t.joinable()) {
-        t.join();
-      }
+      if (t.joinable()) t.join();
     }
     reader_threads.clear();
   }
 
+  std::array<std::optional<ForceSensorData>, kFingerCount> get_latest_data() const {
+    std::array<std::optional<ForceSensorData>, kFingerCount> out{};
+    for (std::size_t i = 0; i < kFingerCount; ++i) {
+      out[i] = fingers[i]->get_latest_data();
+    }
+    return out;
+  }
+
+ private:
   void aggregation_loop(
-      const std::unordered_map<std::string, IterableQueue<ForceSensorData>>& finger_queues_copy,
+      const std::array<IterableQueue<ForceSensorData>, kFingerCount>& finger_queues,
       IterableQueue<AllFingersData> output_queue) {
-    auto intermediate_queue =
-        std::make_shared<IterableQueue<std::pair<std::string, ForceSensorData>>>();
+    // Intermediate queue: (finger_index, data)
+    auto intermediate =
+        std::make_shared<IterableQueue<std::pair<std::size_t, ForceSensorData>>>();
 
     reader_threads.clear();
-    for (const auto& entry : finger_queues_copy) {
-      const std::string finger_name = entry.first;
-      const auto finger_queue = entry.second;
-
-      reader_threads.emplace_back([finger_name, finger_queue, intermediate_queue] {
+    for (std::size_t i = 0; i < kFingerCount; ++i) {
+      auto fq = finger_queues[i];
+      reader_threads.emplace_back([i, fq, intermediate] {
         try {
-          for (const auto& data : finger_queue) {
-            intermediate_queue->put({finger_name, data});
+          for (const auto& data : fq) {
+            intermediate->put({i, data});
           }
-        } catch (...) {
-        }
+        } catch (...) {}
       });
     }
 
-    std::unordered_map<std::string, ForceSensorData> latest{};
+    std::array<std::optional<ForceSensorData>, kFingerCount> latest{};
+    std::size_t collected = 0;
 
     while (aggregation_running.load()) {
-      std::pair<std::string, ForceSensorData> item;
+      std::pair<std::size_t, ForceSensorData> item;
       try {
-        item = intermediate_queue->get(/*block=*/true, /*timeout_s=*/1.0);
+        item = intermediate->get(/*block=*/true, /*timeout_s=*/1.0);
       } catch (const QueueEmpty&) {
         continue;
       } catch (const StopIteration&) {
         break;
       }
 
-      latest[item.first] = item.second;
-      if (latest.size() != 5) {
-        continue;
+      if (!latest[item.first].has_value()) {
+        collected++;
       }
+      latest[item.first] = item.second;
 
-      AllFingersData snapshot{
-          latest.at("thumb"),
-          latest.at("index"),
-          latest.at("middle"),
-          latest.at("ring"),
-          latest.at("pinky"),
-      };
+      if (collected != kFingerCount) continue;
+
+      AllFingersData snapshot{};
+      for (std::size_t i = 0; i < kFingerCount; ++i) {
+        snapshot.fingers[i] = *latest[i];
+      }
 
       try {
         output_queue.put_nowait(snapshot);
       } catch (const StateError&) {
         break;
       } catch (const QueueFull&) {
-        try {
-          output_queue.get_nowait();
-          output_queue.put_nowait(snapshot);
-        } catch (const QueueEmpty&) {
-        } catch (const StateError&) {
-          break;
-        }
+        try { output_queue.get_nowait(); output_queue.put_nowait(snapshot); }
+        catch (const QueueEmpty&) {}
+        catch (const StateError&) { break; }
       }
 
-      latest.clear();
+      latest = {};
+      collected = 0;
     }
 
-    intermediate_queue->close();
+    intermediate->close();
     output_queue.close();
-  }
-
-  std::unordered_map<std::string, std::optional<ForceSensorData>> get_latest_data() const {
-    std::unordered_map<std::string, std::optional<ForceSensorData>> out;
-    for (const auto& [name, sensor] : fingers) {
-      out[name] = sensor->get_latest_data();
-    }
-    return out;
   }
 
   std::uint32_t arbitration_id;
   CANMessageDispatcher& dispatcher;
   std::shared_ptr<linkerhand::Lifecycle> lifecycle;
 
-  std::unordered_map<std::string, std::unique_ptr<SingleForceSensorManager>> fingers;
+  std::array<std::unique_ptr<SingleForceSensorManager>, kFingerCount> fingers;
 
   mutable std::mutex streaming_mutex;
   std::optional<IterableQueue<AllFingersData>> streaming_queue;
@@ -569,6 +507,8 @@ struct ForceSensorManager::Impl {
   std::thread aggregation_thread;
   std::vector<std::thread> reader_threads;
 };
+
+// ---- ForceSensorManager public API ----
 
 ForceSensorManager::ForceSensorManager(
     std::uint32_t arbitration_id,
@@ -579,22 +519,23 @@ ForceSensorManager::ForceSensorManager(
 
 ForceSensorManager::~ForceSensorManager() = default;
 
-AllFingersData ForceSensorManager::get_data_blocking(double timeout_ms) {
+AllFingersData ForceSensorManager::get_data_blocking(std::chrono::milliseconds timeout) {
   lifecycle_->ensure_open();
-  return impl_->get_data_blocking(timeout_ms);
+  return impl_->get_data_blocking(timeout);
 }
 
-IterableQueue<AllFingersData> ForceSensorManager::stream(double interval_ms, std::size_t maxsize) {
+IterableQueue<AllFingersData> ForceSensorManager::stream(
+    std::chrono::milliseconds interval, std::size_t maxsize) {
   lifecycle_->ensure_open();
-  return impl_->stream(interval_ms, maxsize);
+  return impl_->stream(interval, maxsize);
 }
 
 void ForceSensorManager::stop_streaming() {
-  // stop_streaming is a cleanup operation, allowed in any lifecycle state
   impl_->stop_streaming();
 }
 
-std::unordered_map<std::string, std::optional<ForceSensorData>> ForceSensorManager::get_latest_data() const {
+std::array<std::optional<ForceSensorData>, kFingerCount>
+ForceSensorManager::get_latest_data() const {
   lifecycle_->ensure_open();
   return impl_->get_latest_data();
 }

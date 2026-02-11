@@ -8,8 +8,11 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <vector>
+
+#include "linkerhand/detail/logger.hpp"
 
 namespace linkerhand {
 
@@ -19,9 +22,14 @@ struct CanMessage {
   std::array<std::uint8_t, 8> data{};
   std::size_t dlc = 0;
 
-  std::vector<std::uint8_t> data_bytes() const {
-    return std::vector<std::uint8_t>(data.begin(), data.begin() + static_cast<std::ptrdiff_t>(dlc));
+  [[nodiscard]] std::vector<std::uint8_t> data_bytes() const {
+    return {data.begin(), data.begin() + static_cast<std::ptrdiff_t>(dlc)};
   }
+};
+
+/// Configuration for CANMessageDispatcher.
+struct CANDispatcherConfig {
+  int poll_timeout_ms = 10;
 };
 
 class CANMessageDispatcher {
@@ -29,8 +37,10 @@ class CANMessageDispatcher {
   using Callback = std::function<void(const CanMessage&)>;
 
   explicit CANMessageDispatcher(
-      const std::string& interface_name,
-      const std::string& interface_type = "socketcan");
+      std::string_view interface_name,
+      std::string_view interface_type = "socketcan",
+      LogCallback logger = default_logger(),
+      CANDispatcherConfig config = CANDispatcherConfig{});
   ~CANMessageDispatcher();
 
   CANMessageDispatcher(const CANMessageDispatcher&) = delete;
@@ -43,7 +53,9 @@ class CANMessageDispatcher {
 
   void send(const CanMessage& msg);
   void stop();
-  bool is_running() const noexcept { return running_.load(std::memory_order_acquire); }
+  [[nodiscard]] bool is_running() const noexcept {
+    return running_.load(std::memory_order_acquire);
+  }
 
  private:
   struct SubscriberState {
@@ -54,13 +66,15 @@ class CANMessageDispatcher {
     SubscriberState(std::size_t id_, Callback callback_)
         : id(id_), callback(std::move(callback_)) {}
 
-    void deactivate() { active.store(false, std::memory_order_release); }
+    void deactivate() noexcept { active.store(false, std::memory_order_release); }
   };
 
   void recv_loop();
 
   std::string interface_name_;
   std::string interface_type_;
+  LogCallback logger_;
+  CANDispatcherConfig config_;
   int socket_fd_ = -1;
 
   std::atomic<bool> running_{false};

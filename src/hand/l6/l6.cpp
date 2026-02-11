@@ -2,7 +2,7 @@
 
 namespace linkerhand::hand::l6 {
 
-L6::L6(const std::string& side, const std::string& interface_name, const std::string& interface_type)
+L6::L6(std::string_view side, std::string_view interface_name, std::string_view interface_type)
     : lifecycle_(std::make_shared<linkerhand::Lifecycle>("L6")),
       dispatcher_(interface_name, interface_type),
       arbitration_id_(side == "right" ? 0x27 : 0x28),
@@ -17,19 +17,14 @@ L6::~L6() {
 }
 
 void L6::close() {
-  // Idempotent: lifecycle_->close() returns false if already closed
   if (!lifecycle_->close()) {
     return;
   }
-
-  // Stop all streaming (cleanup operations, allowed after close)
   try {
     force_sensor.stop_streaming();
     angle.stop_streaming();
   } catch (...) {
   }
-
-  // Stop the communication layer
   try {
     dispatcher_.stop();
   } catch (...) {

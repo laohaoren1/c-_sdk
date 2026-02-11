@@ -3,7 +3,7 @@
 #include <algorithm>
 #include <cerrno>
 #include <cstring>
-#include <iostream>
+#include <string>
 
 #include "linkerhand/exceptions.hpp"
 
@@ -20,9 +20,14 @@
 namespace linkerhand {
 
 CANMessageDispatcher::CANMessageDispatcher(
-    const std::string& interface_name,
-    const std::string& interface_type)
-    : interface_name_(interface_name), interface_type_(interface_type) {
+    std::string_view interface_name,
+    std::string_view interface_type,
+    LogCallback logger,
+    CANDispatcherConfig config)
+    : interface_name_(interface_name),
+      interface_type_(interface_type),
+      logger_(std::move(logger)),
+      config_(config) {
   if (interface_type_ != "socketcan") {
     throw ValidationError("Only 'socketcan' interface_type is supported");
   }
@@ -154,12 +159,12 @@ void CANMessageDispatcher::recv_loop() {
   pfd.events = POLLIN;
 
   while (running_.load()) {
-    const int ret = ::poll(&pfd, 1, 10);
+    const int ret = ::poll(&pfd, 1, config_.poll_timeout_ms);
     if (ret < 0) {
       if (errno == EINTR) {
         continue;
       }
-      std::cerr << "CANMessageDispatcher poll error: " << std::strerror(errno) << "\n";
+      logger_(LogLevel::kError, std::string("poll error: ") + std::strerror(errno));
       continue;
     }
     if (ret == 0) {
@@ -175,7 +180,7 @@ void CANMessageDispatcher::recv_loop() {
       if (errno == EINTR) {
         continue;
       }
-      std::cerr << "CANMessageDispatcher read error: " << std::strerror(errno) << "\n";
+      logger_(LogLevel::kError, std::string("read error: ") + std::strerror(errno));
       continue;
     }
     if (n != static_cast<ssize_t>(sizeof(frame))) {
@@ -205,9 +210,9 @@ void CANMessageDispatcher::recv_loop() {
       try {
         subscriber->callback(msg);
       } catch (const std::exception& e) {
-        std::cerr << "CANMessageDispatcher callback error: " << e.what() << "\n";
+        logger_(LogLevel::kError, std::string("callback error: ") + e.what());
       } catch (...) {
-        std::cerr << "CANMessageDispatcher callback error: unknown\n";
+        logger_(LogLevel::kError, "callback error: unknown");
       }
     }
   }

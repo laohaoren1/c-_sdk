@@ -8,7 +8,7 @@ file(GLOB_RECURSE LINKERHAND_CPP_SDK_SOURCES CONFIGURE_DEPENDS
 
 add_library(linkerhand_cpp_sdk ${LINKERHAND_CPP_SDK_SOURCES})
 
-target_compile_features(linkerhand_cpp_sdk PUBLIC cxx_std_17)
+target_compile_features(linkerhand_cpp_sdk PUBLIC cxx_std_20)
 target_include_directories(linkerhand_cpp_sdk PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/include")
 
 find_package(Threads REQUIRED)

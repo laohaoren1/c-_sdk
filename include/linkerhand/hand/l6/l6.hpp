@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <string_view>
 
 #include "linkerhand/can_dispatcher.hpp"
 #include "linkerhand/exceptions.hpp"
@@ -19,7 +20,9 @@ class L6 {
   std::uint32_t arbitration_id_ = 0x28;
 
  public:
-  L6(const std::string& side, const std::string& interface_name, const std::string& interface_type = "socketcan");
+  L6(std::string_view side,
+     std::string_view interface_name,
+     std::string_view interface_type = "socketcan");
   ~L6();
 
   L6(const L6&) = delete;
@@ -29,7 +32,7 @@ class L6 {
   ForceSensorManager force_sensor;
 
   void close();
-  bool is_closed() const;
+  [[nodiscard]] bool is_closed() const;
 };
 
 }  // namespace linkerhand::hand::l6

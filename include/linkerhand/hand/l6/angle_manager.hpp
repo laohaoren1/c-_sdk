@@ -1,11 +1,12 @@
 #pragma once
 
 #include <array>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <optional>
-#include <vector>
+#include <span>
 
 #include "linkerhand/can_dispatcher.hpp"
 #include "linkerhand/iterable_queue.hpp"
@@ -29,13 +30,21 @@ class AngleManager {
   AngleManager(const AngleManager&) = delete;
   AngleManager& operator=(const AngleManager&) = delete;
 
-  void set_angles(const std::array<int, 6>& angles);
-  void set_angles(const std::vector<int>& angles);
+  /// Set angles. Accepts any contiguous range of 6 ints (array, vector, span).
+  void set_angles(std::span<const int> angles);
 
-  AngleData get_angles_blocking(double timeout_ms = 100);
-  std::optional<AngleData> get_current_angles() const;
+  /// Blocking get with type-safe duration.
+  [[nodiscard]] AngleData get_angles_blocking(
+      std::chrono::milliseconds timeout = std::chrono::milliseconds{100});
 
-  IterableQueue<AngleData> stream(double interval_ms = 100, std::size_t maxsize = 100);
+  /// Get cached latest value (non-blocking, no CAN I/O).
+  [[nodiscard]] std::optional<AngleData> get_current_angles() const;
+
+  /// Start streaming. Returns a queue that auto-closes when stop_streaming() is called.
+  [[nodiscard]] IterableQueue<AngleData> stream(
+      std::chrono::milliseconds interval = std::chrono::milliseconds{100},
+      std::size_t maxsize = 100);
+
   void stop_streaming();
 
  private:
