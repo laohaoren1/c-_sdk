@@ -17,4 +17,20 @@ target_link_libraries(linkerhand_cpp_sdk PRIVATE Threads::Threads)
 # ============================================================================
 # 测试程序
 # ============================================================================
+enable_testing()
+
+set(TEST_SOURCES
+  tests/test_iterable_queue.cpp
+  tests/test_lifecycle.cpp
+  tests/test_exceptions.cpp
+  tests/test_can_message.cpp
+  tests/test_force_sensor_types.cpp
+)
+
+foreach(test_src ${TEST_SOURCES})
+  get_filename_component(test_name ${test_src} NAME_WE)
+  add_executable(${test_name} ${test_src})
+  target_link_libraries(${test_name} PRIVATE linkerhand_cpp_sdk Threads::Threads)
+  add_test(NAME ${test_name} COMMAND ${test_name})
+endforeach()
 
