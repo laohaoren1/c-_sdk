@@ -1,6 +1,7 @@
 #pragma once
 
 #include <array>
+#include <cassert>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -47,9 +48,11 @@ struct AllFingersData {
   std::array<ForceSensorData, kFingerCount> fingers{};
 
   [[nodiscard]] const ForceSensorData& operator[](Finger f) const noexcept {
+    assert(static_cast<std::size_t>(f) < kFingerCount);
     return fingers[static_cast<std::size_t>(f)];
   }
   [[nodiscard]] ForceSensorData& operator[](Finger f) noexcept {
+    assert(static_cast<std::size_t>(f) < kFingerCount);
     return fingers[static_cast<std::size_t>(f)];
   }
 };

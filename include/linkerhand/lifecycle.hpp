@@ -36,12 +36,12 @@ class Lifecycle {
     return state_;
   }
 
-  bool is_open() const {
+  [[nodiscard]] bool is_open() const {
     std::lock_guard<std::mutex> lock(mutex_);
     return state_ == LifecycleState::Open;
   }
 
-  bool is_closed() const {
+  [[nodiscard]] bool is_closed() const {
     std::lock_guard<std::mutex> lock(mutex_);
     return state_ == LifecycleState::Closed;
   }
@@ -87,25 +87,24 @@ class Lifecycle {
     return true;
   }
 
-  std::uint64_t notification_count() const {
+  [[nodiscard]] std::uint64_t notification_count() const {
     std::lock_guard<std::mutex> lock(mutex_);
     return notification_count_;
   }
 
-  bool wait_for_notification(std::uint64_t last_notification_count, double timeout_ms) const {
-    if (timeout_ms < 0) {
-      throw ValidationError("timeout_ms must be non-negative");
+  [[nodiscard]] bool wait_for_notification(
+      std::uint64_t last_notification_count,
+      std::chrono::milliseconds timeout) const {
+    if (timeout.count() < 0) {
+      throw ValidationError("timeout must be non-negative");
     }
 
     std::unique_lock<std::mutex> lock(mutex_);
     auto pred = [&] { return notification_count_ != last_notification_count || state_ != LifecycleState::Open; };
-    if (timeout_ms == 0) {
+    if (timeout.count() == 0) {
       return pred();
     }
 
-    const auto timeout =
-        std::chrono::duration_cast<std::chrono::steady_clock::duration>(
-            std::chrono::duration<double, std::milli>(timeout_ms));
     return cv_.wait_for(lock, timeout, pred);
   }
 
