@@ -34,3 +34,7 @@ foreach(test_src ${TEST_SOURCES})
   add_test(NAME ${test_name} COMMAND ${test_name})
 endforeach()
 
+# 硬件测试（不加入 ctest，需手动运行）
+add_executable(test_hardware tests/test_hardware.cpp)
+target_link_libraries(test_hardware PRIVATE linkerhand_cpp_sdk Threads::Threads)
+
